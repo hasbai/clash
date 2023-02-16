@@ -16,18 +16,30 @@ func DialContext(ctx context.Context, network, address string, options ...Option
 			return nil, err
 		}
 
-		var ip net.IP
-		switch network {
-		case "tcp4", "udp4":
-			ip, err = resolver.ResolveIPv4(host)
-		default:
-			ip, err = resolver.ResolveIPv6(host)
-		}
-		if err != nil {
-			return nil, err
+		ip, cached := getIP(host)
+		if !cached {
+			switch network {
+			case "tcp4", "udp4":
+				ip, err = resolver.ResolveIPv4(host)
+			default:
+				ip, err = resolver.ResolveIPv6(host)
+			}
+			if err != nil {
+				return nil, err
+			}
 		}
 
-		return dialContext(ctx, network, ip, port, options)
+		conn, err := dialContext(ctx, network, ip, port, options)
+		if err != nil {
+			if cached {
+				deleteIP(host)
+			}
+		} else {
+			if !cached {
+				setIP(host, ip)
+			}
+		}
+		return conn, err
 	case "tcp", "udp":
 		return dualStackDialContext(ctx, network, address, options)
 	default:
@@ -109,6 +121,8 @@ func dualStackDialContext(ctx context.Context, network, address string, options 
 		resolved bool
 		ipv6     bool
 		done     bool
+		ip       net.IP
+		cached   bool
 	}
 	results := make(chan dialResult)
 	var primary, fallback dialResult
@@ -125,15 +139,19 @@ func dualStackDialContext(ctx context.Context, network, address string, options 
 			}
 		}()
 
-		var ip net.IP
-		if ipv6 {
-			ip, result.error = resolver.ResolveIPv6(host)
-		} else {
-			ip, result.error = resolver.ResolveIPv4(host)
+		ip, cached := getIP(host)
+		if !cached {
+			if ipv6 {
+				ip, result.error = resolver.ResolveIPv6(host)
+			} else {
+				ip, result.error = resolver.ResolveIPv4(host)
+			}
+			if result.error != nil {
+				return
+			}
 		}
-		if result.error != nil {
-			return
-		}
+		result.ip = ip
+		result.cached = cached
 		result.resolved = true
 
 		result.Conn, result.error = dialContext(ctx, network, ip, port, options)
@@ -144,6 +162,9 @@ func dualStackDialContext(ctx context.Context, network, address string, options 
 
 	for res := range results {
 		if res.error == nil {
+			if !res.cached {
+				setIP(host, res.ip)
+			}
 			return res.Conn, nil
 		}
 
@@ -155,12 +176,16 @@ func dualStackDialContext(ctx context.Context, network, address string, options 
 
 		if primary.done && fallback.done {
 			if primary.resolved {
-				return nil, primary.error
+				err = primary.error
 			} else if fallback.resolved {
-				return nil, fallback.error
+				err = fallback.error
 			} else {
-				return nil, primary.error
+				err = primary.error
 			}
+			if res.cached {
+				deleteIP(host)
+			}
+			return nil, err
 		}
 	}
 
